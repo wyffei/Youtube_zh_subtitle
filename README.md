@@ -4,13 +4,17 @@
 - 视频本身有字幕（人工上传或 YouTube 自动生成）→ 插件直接抓取并翻译
 - 视频完全没有字幕 → 调用本地跑的 Whisper 做语音识别，再翻译
 
-架构：浏览器插件只负责显示，语音识别和翻译这些重活丢给本机跑的 Python 服务，
-不需要买/租云服务器，仅供自己电脑本地使用。插件的 `content.js` 直接 fetch 本地
-后端（manifest 的 `host_permissions` 已经放行跨域），没有走 service worker 中转——
-Whisper 转录动辄几分钟，service worker 闲置太久会被 Chrome 强制杀掉，中转会导致
-请求中途被打断。
+架构：浏览器插件只负责显示，语音识别和翻译交给本机运行的 Python 服务。
 
-## 安装步骤
+> 插件内部，内容脚本 `content.js` 直接 `fetch` 本地后端，不经过 Manifest V3 的
+> background service worker 中转。
+
+> 原因：Chrome 会在 service worker 闲置或单次任务
+> 运行过久后将其终止，而 Whisper 转录常需十几分钟，经 service worker 转发的请求会
+> 在运行过程中被中断。manifest 的 `host_permissions` 已授予内容脚本访问本地后端的
+> 跨域权限，因此 `content.js` 可以绕开 service worker，不受其生命周期限制。
+
+## 使用步骤
 
 ### 1. 启动本地后端
 
@@ -22,8 +26,8 @@ python server.py
 
 第一次做语音识别时会自动下载 Whisper 模型权重，会比较慢，之后就快了。
 
-音频转码用的 ffmpeg/ffprobe 由 `static-ffmpeg` 这个包提供（`pip install` 一起装好，
-首次用到时自动下载对应平台的二进制），不需要自己单独装 ffmpeg 或改系统 PATH。
+yt-dlp/whisper 处理音频需要用到 ffmpeg/ffprobe，这两个可执行文件由 `static-ffmpeg`
+这个 pip 包提供，不单独装 ffmpeg（不装到系统里，也不改系统全局的 PATH）。
 
 Whisper 模型大小在 `backend/server.py` 的 `get_whisper_model(size="small")` 里配置，
 从小到大依次是 `tiny` / `base` / `small` / `medium` / `large`：模型越大识别越准但越慢，
@@ -31,7 +35,7 @@ Whisper 模型大小在 `backend/server.py` 的 `get_whisper_model(size="small")
 
 #### 可选：用 NVIDIA GPU 加速
 
-默认装的是 CPU 版 torch，长视频转录会很慢。有 NVIDIA 显卡的话换成 CUDA 版能快一个数量级：
+默认是 CPU 版 torch，可换成 CUDA 版：
 
 ```bash
 pip uninstall torch -y
@@ -61,14 +65,29 @@ python -c "import torch; print(torch.cuda.is_available())"  # 打印 True 就是
   不会重复下载音频、重新跑 Whisper（刷新页面/重新打开也直接用缓存，基本秒开）。想强制
   重新识别的话，删掉对应的缓存文件（或整个 `.cache` 目录）即可。
 
+### 4. 结束使用
+
+**停止后端**：回到跑 `python server.py` 的那个终端窗口，按 `Ctrl+C` 就行，不需要
+一直挂着——不用的时候关掉，下次要用再开一下即可。如果终端窗口已经关掉、不确定
+服务还在不在跑，可以按端口号（8000）查出对应进程再结束掉：
+
+```powershell
+# Windows / PowerShell
+netstat -ano | findstr :8000     # 最后一列是 PID
+taskkill /PID <上面查到的PID> /F
+```
+
+**停用/卸载插件**：去 `chrome://extensions`，找到"YouTube 中文字幕"这张卡片——
+右上角的开关是临时禁用（保留安装，随时能重新打开）；卡片上的"移除"(Remove) 按钮
+是彻底卸载。
+
 ## 已知局限
 
 - VTT 解析是简化版本，遇到复杂样式标签可能有瑕疵
 - 翻译用的是免费的 Google 翻译接口，长视频（几百段字幕）逐句调用可能会被限流或变慢，
   可以考虑合并成批量翻译，或换成大模型 API 做上下文感知翻译；这一步目前没有进度显示。
   遇到限流时会自动重试几次，还不行就退回显示原文，不会再把 Google 的错误页内容当成字幕显示出来
-- 字幕轨道选择逻辑比较简单：优先选英语字幕（其中再优先人工字幕），没有英语的话就
-  随便挑一条（同样优先人工字幕）
+- 字幕轨道选择逻辑：优先人工字幕中的英语字幕，没有的话就随便挑一条，其次是自动生成字幕。
 - 识别任务状态存在进程内存里（`_jobs` 字典），重启后端会丢失所有进行中任务的进度
   （已完成的结果因为落了缓存文件，不受影响）
 
