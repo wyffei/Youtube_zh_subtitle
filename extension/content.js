@@ -27,15 +27,27 @@ async function transcribeViaBackend(videoUrl, onProgress) {
   }
 }
 
-async function translateViaBackend(segments) {
-  const res = await fetch(`${BACKEND}/translate`, {
+// 翻译同样做成"提交任务 + 轮询"，后端边翻边把已完成的部分写回 job，
+// 这里每 1.5 秒查一次，拿到的是持续变长的已翻译列表，可以边看边显示，
+// 不用等几百句字幕全部翻完才能看到第一条
+async function translateViaBackend(segments, onUpdate) {
+  const startRes = await fetch(`${BACKEND}/translate/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ segments }),
   });
-  if (!res.ok) throw new Error(`translate failed: ${res.status}`);
-  const data = await res.json();
-  return data.segments;
+  if (!startRes.ok) throw new Error(`translate start failed: ${startRes.status}`);
+  const { job_id } = await startRes.json();
+
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const statusRes = await fetch(`${BACKEND}/translate/status?job_id=${job_id}`);
+    if (!statusRes.ok) throw new Error(`translate status failed: ${statusRes.status}`);
+    const job = await statusRes.json();
+    if (job.status === "error") throw new Error(job.error || "translate failed");
+    onUpdate?.(job);
+    if (job.status === "done") return job.segments;
+  }
 }
 
 let currentSegments = []; // [{start, end, text}]，已经是中文
@@ -154,9 +166,17 @@ async function loadSubtitlesForCurrentVideo(captionTracks) {
 
     if (!originalSegments.length) return;
 
-    const el = ensureOverlay();
-    if (el) el.textContent = "翻译中...";
-    currentSegments = await translateViaBackend(originalSegments);
+    currentSegments = await translateViaBackend(originalSegments, (job) => {
+      // 已翻好的部分随每次轮询更新，一旦有第一批结果就可以开始显示，
+      // 不用等 job 整体 status 变成 done
+      currentSegments = job.segments ?? [];
+      if (currentSegments.length) {
+        subtitlesReady = true;
+      } else {
+        const el = ensureOverlay();
+        if (el) el.textContent = `翻译中...${job.progress ?? 0}%`;
+      }
+    });
     subtitlesReady = true;
     console.log(`[YT中文字幕] 已加载 ${currentSegments.length} 条中文字幕`);
   } catch (err) {

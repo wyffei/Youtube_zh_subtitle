@@ -172,19 +172,56 @@ def _translate_with_retry(translator, text, retries=3, delay=0.5):
     return text  # 重试几次还是不行，退回原文，至少不是错误页乱码
 
 
-@app.route("/translate", methods=["POST"])
-def translate():
-    """把一批 {start, end, text} 翻译成中文，时间戳原样返回"""
+_translate_jobs = {}  # job_id -> {"status": ..., "progress": 0, "segments": [已翻好的部分], "error": "..."}
+_translate_jobs_lock = threading.Lock()
+
+
+def _run_translate_job(job_id, segments):
+    """逐句翻译一批字幕，每翻完一句就把目前为止的结果写回 job，
+    这样插件那边轮询到的是"持续变长的已翻译列表"，可以边看边显示，
+    不用等几百句全翻完才拿到第一条"""
+    translator = GoogleTranslator(source="auto", target="zh-CN")
+    translated = []
+    try:
+        for seg in segments:
+            zh_text = _translate_with_retry(translator, seg["text"])
+            translated.append({**seg, "text": zh_text})
+            with _translate_jobs_lock:
+                job = _translate_jobs.get(job_id)
+                if job:
+                    job["segments"] = list(translated)
+                    job["progress"] = round(len(translated) / len(segments) * 100)
+        with _translate_jobs_lock:
+            _translate_jobs[job_id] = {"status": "done", "progress": 100, "segments": translated}
+    except Exception as e:
+        with _translate_jobs_lock:
+            _translate_jobs[job_id] = {"status": "error", "progress": 0, "error": str(e)}
+
+
+@app.route("/translate/start", methods=["POST"])
+def translate_start():
+    """把一批 {start, end, text} 提交去翻译，立刻返回 job_id，
+    翻译本身跟 /transcribe/start 一样放到后台线程里跑，交给轮询 /translate/status 去看进度和已翻好的部分"""
     data = request.get_json()
     segments = data.get("segments", [])
-    translator = GoogleTranslator(source="auto", target="zh-CN")
+    if not segments:
+        return jsonify({"error": "missing segments"}), 400
 
-    translated = []
-    for seg in segments:
-        zh_text = _translate_with_retry(translator, seg["text"])
-        translated.append({**seg, "text": zh_text})
+    job_id = str(uuid.uuid4())
+    with _translate_jobs_lock:
+        _translate_jobs[job_id] = {"status": "running", "progress": 0, "segments": []}
+    threading.Thread(target=_run_translate_job, args=(job_id, segments), daemon=True).start()
+    return jsonify({"job_id": job_id})
 
-    return jsonify({"segments": translated})
+
+@app.route("/translate/status")
+def translate_status():
+    job_id = request.args.get("job_id")
+    with _translate_jobs_lock:
+        job = _translate_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job_id"}), 404
+    return jsonify(job)
 
 
 if __name__ == "__main__":
