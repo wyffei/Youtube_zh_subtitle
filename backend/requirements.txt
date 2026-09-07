@@ -1,0 +1,6 @@
+flask
+flask-cors
+yt-dlp
+openai-whisper
+deep-translator
+static-ffmpeg
