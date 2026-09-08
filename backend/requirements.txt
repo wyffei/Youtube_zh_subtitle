@@ -2,5 +2,5 @@ flask
 flask-cors
 yt-dlp
 openai-whisper
-deep-translator
+requests
 static-ffmpeg

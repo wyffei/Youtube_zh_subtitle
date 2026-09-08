@@ -15,3 +15,19 @@
   pointer-events: none;
   white-space: pre-wrap;
 }
+
+/* 翻译进度角标：独立于字幕悬浮层，不会被播放同步逻辑覆盖，
+   这样字幕已经开始显示之后，仍然能看到后面部分翻译到哪了 */
+#yt-zh-sub-progress {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  padding: 3px 10px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1.4;
+  border-radius: 4px;
+  z-index: 60;
+  pointer-events: none;
+}

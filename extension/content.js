@@ -30,11 +30,11 @@ async function transcribeViaBackend(videoUrl, onProgress) {
 // 翻译同样做成"提交任务 + 轮询"，后端边翻边把已完成的部分写回 job，
 // 这里每 1.5 秒查一次，拿到的是持续变长的已翻译列表，可以边看边显示，
 // 不用等几百句字幕全部翻完才能看到第一条
-async function translateViaBackend(segments, onUpdate) {
+async function translateViaBackend(segments, videoId, onUpdate) {
   const startRes = await fetch(`${BACKEND}/translate/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ segments }),
+    body: JSON.stringify({ segments, video_id: videoId }),
   });
   if (!startRes.ok) throw new Error(`translate start failed: ${startRes.status}`);
   const { job_id } = await startRes.json();
@@ -77,10 +77,28 @@ function ensureOverlay() {
   return overlayEl;
 }
 
+let progressEl = null;
+function ensureProgressBadge() {
+  if (progressEl && document.body.contains(progressEl)) return progressEl;
+  const player = document.querySelector("#movie_player");
+  if (!player) return null;
+  progressEl = document.createElement("div");
+  progressEl.id = "yt-zh-sub-progress";
+  player.appendChild(progressEl);
+  return progressEl;
+}
+
+function removeProgressBadge() {
+  progressEl?.remove();
+  progressEl = null;
+}
+
 function findCurrentText(t) {
-  // 分段数量不大，线性查找足够用
+  // 分段数量不大，线性查找足够用；中英双语显示，zh 是翻译，text 是原文
   for (const seg of currentSegments) {
-    if (t >= seg.start && t <= seg.end) return seg.text;
+    if (t >= seg.start && t <= seg.end) {
+      return seg.zh ? `${seg.text}\n${seg.zh}` : seg.text;
+    }
   }
   return "";
 }
@@ -94,7 +112,9 @@ function startSyncLoop() {
     if (!subtitlesReady) return;
     const el = ensureOverlay();
     if (!el) return;
-    el.textContent = findCurrentText(video.currentTime);
+    const text = findCurrentText(video.currentTime);
+    el.textContent = text;
+    el.hidden = !text; // 没有字幕的时间段不显示空的黑框
   });
 }
 
@@ -166,21 +186,22 @@ async function loadSubtitlesForCurrentVideo(captionTracks) {
 
     if (!originalSegments.length) return;
 
-    currentSegments = await translateViaBackend(originalSegments, (job) => {
-      // 已翻好的部分随每次轮询更新，一旦有第一批结果就可以开始显示，
-      // 不用等 job 整体 status 变成 done
+    currentSegments = await translateViaBackend(originalSegments, videoId, (job) => {
+      // 已翻好的部分随每次轮询更新，一旦有第一批结果就可以开始显示字幕，
+      // 不用等 job 整体 status 变成 done；进度角标独立于字幕悬浮层，
+      // 不会被播放同步逻辑覆盖，翻译没跑完之前一直能看到进度
       currentSegments = job.segments ?? [];
-      if (currentSegments.length) {
-        subtitlesReady = true;
-      } else {
-        const el = ensureOverlay();
-        if (el) el.textContent = `翻译中...${job.progress ?? 0}%`;
-      }
+      if (currentSegments.length) subtitlesReady = true;
+
+      const badge = ensureProgressBadge();
+      if (badge) badge.textContent = `翻译中...${job.progress ?? 0}%`;
     });
+    removeProgressBadge();
     subtitlesReady = true;
     console.log(`[YT中文字幕] 已加载 ${currentSegments.length} 条中文字幕`);
   } catch (err) {
     console.error("[YT中文字幕] 加载字幕出错：", err);
+    removeProgressBadge();
   }
 }
 
@@ -198,5 +219,6 @@ document.addEventListener("yt-navigate-finish", () => {
   overlayEl = null;
   syncBound = false;
   subtitlesReady = false;
+  removeProgressBadge();
   startSyncLoop();
 });
