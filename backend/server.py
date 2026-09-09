@@ -44,6 +44,18 @@ _http_session.mount(
     "https://", requests.adapters.HTTPAdapter(pool_maxsize=TRANSLATE_CONCURRENCY)
 )
 
+# 识别现在按音频块推进，一块识别完就可能有好几个 /translate/start 同时在跑
+# （每块各自一个翻译 job），如果每个 job 各开一个 ThreadPoolExecutor，实际并发数会
+# 变成"块数 × TRANSLATE_CONCURRENCY"，失去限流的意义；改成全局唯一一个执行器，
+# 所有翻译任务共用同一份并发额度，跟只有一个 job 时的限流效果一致
+_translate_executor = ThreadPoolExecutor(max_workers=TRANSLATE_CONCURRENCY)
+
+# 音频切块大小（秒）。识别改成一块一块地做，一块识别完就能立刻把这块交给翻译，
+# 不用等整段视频识别完才开始翻第一句字幕；块切得越小，第一批字幕出现得越快，
+# 但 whisper 调用次数变多、块边界处的识别准确率也会略打折扣。45 秒是个折中的经验值——
+# 之前设成 120 秒时，几分钟的短视频整个音频还凑不够一块，切块等于没切
+CHUNK_SECONDS = 45
+
 app = Flask(__name__)
 CORS(app)  # 允许插件跨域访问本地服务
 
@@ -83,16 +95,20 @@ _progress_local = threading.local()  # 每个转录任务在自己的线程里�
 
 class _ProgressTqdm(tqdm.tqdm):
     """whisper 内部用 tqdm 按帧数汇报解码进度，这里拦下来写进对应 job 的状态里，
-    不需要动 whisper 自己的代码"""
+    不需要动 whisper 自己的代码。现在识别是按块跑的，这里汇报的是"当前块内部"的解码
+    进度，要结合 chunk_index/total_chunks 才能算出整段视频的总体进度"""
 
     def update(self, n=1):
         self.n = getattr(self, "n", 0) + n
         job_id = getattr(_progress_local, "job_id", None)
         if job_id and self.total:
+            chunk_index = getattr(_progress_local, "chunk_index", 0)
+            total_chunks = getattr(_progress_local, "total_chunks", 1)
+            overall_fraction = (chunk_index + self.n / self.total) / total_chunks
             with _jobs_lock:
                 job = _jobs.get(job_id)
                 if job:
-                    job["progress"] = min(99, round(self.n / self.total * 100))
+                    job["progress"] = min(99, round(overall_fraction * 100))
 
 
 tqdm.tqdm = _ProgressTqdm
@@ -117,6 +133,33 @@ def health():
     return jsonify({"status": "ok"})
 
 
+def _split_audio_into_chunks(audio_path, out_dir):
+    """按 CHUNK_SECONDS 切块。-c copy 只是重新封装、不重新编码，切分本身几乎不耗时，
+    不会在下载完的基础上再额外花多少时间"""
+    pattern = str(out_dir / "chunk_%04d.mp3")
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-i", str(audio_path),
+            "-f", "segment", "-segment_time", str(CHUNK_SECONDS),
+            "-c", "copy", "-reset_timestamps", "1",
+            pattern,
+        ],
+        check=True,
+    )
+    return sorted(out_dir.glob("chunk_*.mp3"))
+
+
+def _probe_duration(path):
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    return float(probe.stdout.strip())
+
+
 def _run_transcribe_job(job_id, url):
     _progress_local.job_id = job_id  # 让 _ProgressTqdm 知道这个线程里的进度该记到哪个 job
     try:
@@ -125,20 +168,57 @@ def _run_transcribe_job(job_id, url):
         if cache_path and cache_path.exists():
             print(f"[缓存命中] {video_id} 之前识别过，直接用缓存结果")
             segments = json.loads(cache_path.read_text(encoding="utf-8"))["segments"]
-        else:
-            with tempfile.TemporaryDirectory() as tmp:
-                audio_path = Path(tmp) / "audio.mp3"
-                subprocess.run(
-                    ["yt-dlp", "-x", "--audio-format", "mp3", "-o", str(audio_path), url],
-                    check=True,
-                )
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "done", "progress": 100, "segments": segments}
+            return
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            audio_path = tmp_path / "audio.mp3"
+            t0 = time.time()
+            # url 是浏览器地址栏的完整 href：如果这条视频是从播放列表里点进去看的，
+            # 地址栏会带上 &list=...&index=... 参数，yt-dlp 看到 list 参数默认会把
+            # 整个播放列表都下载下来（观察到过真实案例：想识别 1 条视频结果拉了
+            # 一个 300+ 条的列表），--no-playlist 强制只处理链接直接指向的这一条
+            subprocess.run(
+                [
+                    "yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3",
+                    "-o", str(audio_path), url,
+                ],
+                check=True,
+            )
+            print(f"[计时] 下载音频耗时 {time.time() - t0:.1f} 秒")
+
+            chunk_paths = _split_audio_into_chunks(audio_path, tmp_path)
+            total_chunks = len(chunk_paths) or 1
+            _progress_local.total_chunks = total_chunks
+
+            # 一块一块识别：识别完一块就立刻把目前累积到的全部 segments 写进 job，
+            # 插件那边一旦看到 segments 变长，就会把新出现的部分立刻送去翻译，
+            # 不用等这里的 for 循环整个跑完
+            segments = []
+            offset = 0.0
+            t1 = time.time()
+            for idx, chunk_path in enumerate(chunk_paths):
+                _progress_local.chunk_index = idx
                 with _whisper_lock:
                     model = get_whisper_model()
-                    result = model.transcribe(str(audio_path))
-                segments = [
-                    {"start": s["start"], "end": s["end"], "text": s["text"].strip()}
-                    for s in result["segments"]
-                ]
+                    result = model.transcribe(str(chunk_path))
+                for s in result["segments"]:
+                    text = s["text"].strip()
+                    if text:
+                        segments.append(
+                            {"start": s["start"] + offset, "end": s["end"] + offset, "text": text}
+                        )
+                offset += _probe_duration(chunk_path)
+
+                with _jobs_lock:
+                    job = _jobs.get(job_id)
+                    if job:
+                        job["segments"] = list(segments)
+                        job["progress"] = min(99, round((idx + 1) / total_chunks * 100))
+            print(f"[计时] Whisper 识别耗时 {time.time() - t1:.1f} 秒（共 {total_chunks} 块）")
+
             if cache_path:
                 cache_path.write_text(
                     json.dumps({"segments": segments}, ensure_ascii=False), encoding="utf-8"
@@ -161,7 +241,7 @@ def transcribe_start():
 
     job_id = str(uuid.uuid4())
     with _jobs_lock:
-        _jobs[job_id] = {"status": "running", "progress": 0}
+        _jobs[job_id] = {"status": "running", "progress": 0, "segments": []}
     threading.Thread(target=_run_transcribe_job, args=(job_id, url), daemon=True).start()
     return jsonify({"job_id": job_id})
 
@@ -171,6 +251,68 @@ def transcribe_status():
     job_id = request.args.get("job_id")
     with _jobs_lock:
         job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job_id"}), 404
+    return jsonify(job)
+
+
+_caption_jobs = {}  # job_id -> {"status": "running"|"done"|"error", "vtt": "...", "error": "..."}
+_caption_jobs_lock = threading.Lock()
+
+
+def _run_captions_job(job_id, url, lang):
+    """视频本身有字幕时，插件以前是直接在浏览器里 fetch YouTube 的字幕文件，
+    但这条请求经常被当成爬虫拒绝——返回 200 但内容是空的（YouTube 播放器自己发的
+    同一个请求能拿到真实内容，插件发的就不行，大概率是靠请求来源的
+    Sec-Fetch-*/来源信息之类的标记做区分）。改成用 yt-dlp 来抓：它是专门维护、
+    持续跟进 YouTube 反爬变化的项目，比自己猜怎么绕过靠谱得多。--skip-download
+    只拉字幕文件，不下载音视频本体，比识别那条路径快得多"""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            out_template = str(tmp_path / "sub")
+            t0 = time.time()
+            subprocess.run(
+                [
+                    "yt-dlp", "--no-playlist", "--skip-download",
+                    "--write-subs", "--write-auto-subs",
+                    "--sub-langs", lang or "en",
+                    "--sub-format", "vtt",
+                    "-o", out_template,
+                    url,
+                ],
+                check=True,
+            )
+            print(f"[计时] 抓字幕耗时 {time.time() - t0:.1f} 秒")
+            vtt_files = list(tmp_path.glob("*.vtt"))
+            vtt_text = vtt_files[0].read_text(encoding="utf-8") if vtt_files else ""
+
+        with _caption_jobs_lock:
+            _caption_jobs[job_id] = {"status": "done", "vtt": vtt_text}
+    except Exception as e:
+        with _caption_jobs_lock:
+            _caption_jobs[job_id] = {"status": "error", "error": str(e)}
+
+
+@app.route("/captions/start")
+def captions_start():
+    url = request.args.get("url")
+    lang = request.args.get("lang") or "en"
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+
+    job_id = str(uuid.uuid4())
+    with _caption_jobs_lock:
+        _caption_jobs[job_id] = {"status": "running"}
+    threading.Thread(target=_run_captions_job, args=(job_id, url, lang), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/captions/status")
+def captions_status():
+    job_id = request.args.get("job_id")
+    with _caption_jobs_lock:
+        job = _caption_jobs.get(job_id)
     if not job:
         return jsonify({"error": "unknown job_id"}), 404
     return jsonify(job)
@@ -247,25 +389,30 @@ def _save_translate_cache_entry(cache_path, index, segment):
         cache_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-def _run_translate_job(job_id, segments, video_id=None):
+def _run_translate_job(job_id, segments, video_id=None, offset=0):
     """并发翻译一批字幕里还没翻过的部分（而不是一句等完再等下一句），每翻完一句就把
     目前为止的结果写回 job 并存进磁盘缓存。插件那边轮询到的是"持续变长的已翻译列表"，
     可以边看边显示。字幕是按时间戳查找显示的（不依赖数组顺序），所以哪句先并发翻完
-    就先放进去，完全没问题"""
+    就先放进去，完全没问题。
+
+    offset 是这批 segments 在"完整这一个视频的字幕列表"里的起始下标——识别现在是
+    分块推进的，同一个视频会分好几批（每块一批）提交到这里翻译，offset 让每批各自
+    算出的下标能对上完整字幕里的绝对位置，不然不同块各自从 0 开始编号，会在磁盘缓存
+    里互相覆盖对方已经翻好的结果"""
     cache_path = TRANSLATE_CACHE_DIR / f"{video_id}.json" if video_id else None
     cached = _load_translate_cache(cache_path)
 
     results = [None] * len(segments)
     pending_indices = []
     for i in range(len(segments)):
-        if i in cached:
-            results[i] = cached[i]
+        if (offset + i) in cached:
+            results[i] = cached[offset + i]
         else:
             pending_indices.append(i)
 
     done_count = len(segments) - len(pending_indices)
     if done_count:
-        print(f"[翻译缓存命中] {video_id} 已经翻好 {done_count}/{len(segments)} 句，接着翻剩下的")
+        print(f"[翻译缓存命中] {video_id} 这批已经翻好 {done_count}/{len(segments)} 句，接着翻剩下的")
     with _translate_jobs_lock:
         job = _translate_jobs.get(job_id)
         if job:
@@ -274,24 +421,27 @@ def _run_translate_job(job_id, segments, video_id=None):
 
     try:
         if pending_indices:
-            with ThreadPoolExecutor(max_workers=TRANSLATE_CONCURRENCY) as executor:
-                future_to_index = {
-                    executor.submit(_translate_with_deepseek, segments[i]["text"]): i
-                    for i in pending_indices
-                }
-                for future in as_completed(future_to_index):
-                    i = future_to_index[future]
-                    # 保留原文在 "text" 里，中文译文单独放 "zh"，这样插件那边能同时
-                    # 显示中英双语字幕，而不是覆盖掉原文
-                    seg = {**segments[i], "zh": future.result()}
-                    results[i] = seg
-                    done_count += 1
-                    _save_translate_cache_entry(cache_path, i, seg)
-                    with _translate_jobs_lock:
-                        job = _translate_jobs.get(job_id)
-                        if job:
-                            job["segments"] = [s for s in results if s is not None]
-                            job["progress"] = round(done_count / len(segments) * 100)
+            # 用全局共享的执行器而不是在这里新开一个：识别现在按块推进，一个视频短
+            # 时间内可能有好几个块各自对应一个翻译 job 同时在跑，如果每个 job 各开
+            # 一个线程池，总并发数会变成"同时在跑的块数 × TRANSLATE_CONCURRENCY"，
+            # 失去限流本来的意义
+            future_to_index = {
+                _translate_executor.submit(_translate_with_deepseek, segments[i]["text"]): i
+                for i in pending_indices
+            }
+            for future in as_completed(future_to_index):
+                i = future_to_index[future]
+                # 保留原文在 "text" 里，中文译文单独放 "zh"，这样插件那边能同时
+                # 显示中英双语字幕，而不是覆盖掉原文
+                seg = {**segments[i], "zh": future.result()}
+                results[i] = seg
+                done_count += 1
+                _save_translate_cache_entry(cache_path, offset + i, seg)
+                with _translate_jobs_lock:
+                    job = _translate_jobs.get(job_id)
+                    if job:
+                        job["segments"] = [s for s in results if s is not None]
+                        job["progress"] = round(done_count / len(segments) * 100)
 
         with _translate_jobs_lock:
             _translate_jobs[job_id] = {"status": "done", "progress": 100, "segments": results}
@@ -307,13 +457,16 @@ def translate_start():
     data = request.get_json()
     segments = data.get("segments", [])
     video_id = data.get("video_id")
+    offset = int(data.get("offset", 0))
     if not segments:
         return jsonify({"error": "missing segments"}), 400
 
     job_id = str(uuid.uuid4())
     with _translate_jobs_lock:
         _translate_jobs[job_id] = {"status": "running", "progress": 0, "segments": []}
-    threading.Thread(target=_run_translate_job, args=(job_id, segments, video_id), daemon=True).start()
+    threading.Thread(
+        target=_run_translate_job, args=(job_id, segments, video_id, offset), daemon=True
+    ).start()
     return jsonify({"job_id": job_id})
 
 

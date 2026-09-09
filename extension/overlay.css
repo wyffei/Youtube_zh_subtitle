@@ -16,18 +16,25 @@
   white-space: pre-wrap;
 }
 
-/* 翻译进度角标：独立于字幕悬浮层，不会被播放同步逻辑覆盖，
-   这样字幕已经开始显示之后，仍然能看到后面部分翻译到哪了 */
+/* 进度角标容器：独立于字幕悬浮层，不会被播放同步逻辑覆盖。识别和翻译两条流水线
+   可能同时在跑，容器里最多同时放两个角标（识别中 / 翻译中），竖着堆叠 */
 #yt-zh-sub-progress {
   position: absolute;
   top: 12px;
   right: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  z-index: 60;
+  pointer-events: none;
+}
+
+#yt-zh-sub-progress > div {
   padding: 3px 10px;
   background: rgba(0, 0, 0, 0.65);
   color: #fff;
   font-size: 13px;
   line-height: 1.4;
   border-radius: 4px;
-  z-index: 60;
-  pointer-events: none;
 }
